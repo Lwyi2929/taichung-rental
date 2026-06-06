@@ -1,9 +1,26 @@
 from __future__ import annotations
 
 from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from shapely.geometry import Point
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, KFold, cross_validate
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+from sklearn.inspection import PartialDependenceDisplay
+import xgboost as xgb
+import lightgbm as lgb
+import libpysal
+import time, os, gc
 
 APP_ROOT = Path(__file__).resolve().parents[1]
-DATA_PATH = APP_ROOT / "Taichung_rental_houses_v4.gpkg"
+DATA_PATH = APP_ROOT / "df_poi_3.gpkg"
 POI_DIR = APP_ROOT / "POIs"
 ARTIFACT_DIR = APP_ROOT / "artifacts"
 MODEL_ARTIFACT_PATH = ARTIFACT_DIR / "lightgbm_rent_model.joblib"
@@ -15,25 +32,54 @@ SEED = 42
 ML_N = 30_000
 KNN_K = 20
 
+gdf = gpd.read_file(DATA_PATH)
+
+if '建物型態' in gdf.columns:
+    gdf['建物型態'] = gdf['建物型態'].astype(str).str.replace(' ', '')
+    gdf = pd.get_dummies(gdf, columns=['建物型態'], drop_first=True, dtype=float)
+# ================= 整理好的：屋齡轉換區塊 =================
+gdf['交易年月日'] = pd.to_numeric(gdf['交易年月日'], errors='coerce').fillna(0)
+gdf['建築完成年月'] = pd.to_numeric(gdf['建築完成年月'], errors='coerce').fillna(0)
+gdf['交易年'] = (gdf['交易年月日'] // 10000).astype(int)
+gdf['建築年'] = (gdf['建築完成年月'] // 10000).astype(int)
+gdf['屋齡'] = gdf['交易年'] - gdf['建築年']
+gdf.loc[gdf['屋齡'] < 0, '屋齡'] = 0
+gdf.loc[gdf['屋齡'] > 100, '屋齡'] = 0
+# ===============================================================
+building_dummies = [col for col in gdf.columns if col.startswith('建物型態_')]
+
+gdf['inter_apt']   = gdf['dist_to_mrt_log'] * gdf['建物型態_公寓(5樓含以下無電梯)']
+gdf['inter_university']  = gdf['dist_to_mrt_log'] * gdf['dist_to_university_log']
+gdf['inter_core']  = gdf['dist_to_mrt_log'] * gdf['is_core']
+
 BASE_X = [
-    "pet_friendly", "limited", "deposit_months", "mgmt_fee", "water_fee",
-    "area_pings", "parking", "apartment", "elevator_building",
-    "ln_dist_road_railsta", "ln_dist_road_mrt", "ln_dist_road_ubike",
-    "ln_dist_road_highway", "ln_dist_road_park", "ln_dist_road_school",
-    "ln_dist_eucl_temple", "ln_stores_500m", "ln_bus_stops_500m",
-    "ln_medical_service_500m", "core_zone", "air_conditioner", "laundry",
-    "sum_equip_idx",
-]
-INTER_VARS = ["inter_equip", "inter_apt", "inter_elev", "inter_core"]
-SPATIAL_VARS = ["Wy", "W_pet_friendly"]
-FEATURE_COLUMNS = BASE_X + INTER_VARS + SPATIAL_VARS
+    'dist_to_mrt_log', 'dist_to_social_log', 'dist_to_train_log', 'dist_to_hosp_log',
+    'dist_to_park_log', 'dist_to_university_log', 'straight_dist_nimby_log',
+    'straight_dist_temple_log', 'dist_to_attraction_log', 'elem_count_3km_log',
+    'store_count_500m_log', '屋齡','is_core'
+]+ building_dummies
 
 CONTINUOUS_VARS = [
-    "area_pings", "ln_dist_road_railsta", "ln_dist_road_mrt", "ln_dist_road_ubike",
-    "ln_dist_road_highway", "ln_dist_road_park", "ln_dist_road_school",
-    "ln_dist_eucl_temple", "ln_stores_500m", "ln_bus_stops_500m",
-    "ln_medical_service_500m", "sum_equip_idx",
+    'dist_to_mrt_log', 'dist_to_social_log', 'dist_to_train_log', 'dist_to_hosp_log',
+    'dist_to_park_log', 'dist_to_university_log', 'straight_dist_nimby_log',
+    'straight_dist_temple_log', 'dist_to_attraction_log'
 ]
+scaler = StandardScaler()
+gdf_s = gdf.copy()
+gdf_s[CONTINUOUS_VARS] = scaler.fit_transform(gdf[CONTINUOUS_VARS])
+gdf_s['geometry'] = gdf.geometry.apply(
+    lambda geom: Point(geom.x + np.random.normal(0, 0.01),
+                       geom.y + np.random.normal(0, 0.01))
+) #空間擾動
+t0 = time.time()
+w = libpysal.weights.KNN.from_dataframe(gdf_s, k=20) #空間權重矩陣knn取20點
+w.transform = 'r'
+print(f'KNN-20 完成 {time.time()-t0:.1f}s')
+
+y_arr = gdf_s['單價元平方公尺'].values
+gdf_s['Wy']             = libpysal.weights.lag_spatial(w, y_arr) #做空間滯後項
+gdf_s['W_dist_to_mrt_log'] = libpysal.weights.lag_spatial(w, gdf_s['dist_to_mrt_log'].values)
+
 
 USER_CONTINUOUS = ["area_pings", "deposit_months", "mgmt_fee", "water_fee", "sum_equip_idx"]
 USER_BINARY = [
